@@ -9,10 +9,66 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
+	"github.com/mathias-schnell/chirpy/internal/database"
 )
 
 type apiConfig struct {
+	dbQueries      *database.Queries
 	fileserverHits atomic.Int32
+	platform       string
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Email string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	if params.Email == "" {
+		respondWithError(w, http.StatusBadRequest, "Email is required")
+		return
+	}
+
+	newUser := database.CreateUserParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Email:     params.Email,
+	}
+	responseUser, err := cfg.dbQueries.CreateUser(r.Context(), newUser)
+	if err != nil {
+		log.Printf("Failed to create user: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to create user")
+		return
+	}
+
+	user := User{
+		ID:        responseUser.ID,
+		CreatedAt: responseUser.CreatedAt,
+		UpdatedAt: responseUser.UpdatedAt,
+		Email:     responseUser.Email,
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(user)
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -28,8 +84,17 @@ func (cfg *apiConfig) serverGetHitsHandler(w http.ResponseWriter, r *http.Reques
 	w.Write([]byte(fmt.Sprintf("<html><body><h1>Welcome, Chirpy Admin</h1><p>Chirpy has been visited %d times!</p></body></html>", cfg.fileserverHits.Load())))
 }
 
-func (cfg *apiConfig) serverResetHitsHandler(w http.ResponseWriter, r *http.Request) {
+func (cfg *apiConfig) serverResetHandler(w http.ResponseWriter, r *http.Request) {
+	if cfg.platform != "dev" {
+		respondWithError(w, http.StatusForbidden, "Reset is only allowed in dev environment")
+		return
+	}
 	cfg.fileserverHits.Store(0)
+	err := cfg.dbQueries.DeleteUsers(r.Context())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to delete users")
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 }
@@ -89,21 +154,24 @@ func wordFilter(message string) string {
 }
 
 func main() {
-	dbURL := os.Getenv("DB_URL")
-	db, err := sql.Open("postgres", dbURL)
+	godotenv.Load()
+	db, err := sql.Open("postgres", os.Getenv("DB_URL"))
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.Close()
 
-	//dbQueries := database.New(db)
+	apiCfg := &apiConfig{
+		dbQueries: database.New(db),
+		platform:  os.Getenv("PLATFORM"),
+	}
 
-	apiCfg := &apiConfig{}
 	mux := http.NewServeMux()
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
 	mux.HandleFunc("GET /admin/metrics", apiCfg.serverGetHitsHandler)
-	mux.HandleFunc("POST /admin/reset", apiCfg.serverResetHitsHandler)
+	mux.HandleFunc("POST /admin/reset", apiCfg.serverResetHandler)
 	mux.HandleFunc("GET /api/healthz", ready_handler)
+	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
 	mux.HandleFunc("POST /api/validate_chirp", apiCfg.serverValidateChirpHandler)
 	serv := &http.Server{
 		Addr:    ":8080",
