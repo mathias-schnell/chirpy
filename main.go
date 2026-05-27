@@ -30,6 +30,14 @@ type User struct {
 	Email     string    `json:"email"`
 }
 
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
 func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
 		Email string `json:"email"`
@@ -99,9 +107,10 @@ func (cfg *apiConfig) serverResetHandler(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusOK)
 }
 
-func (cfg *apiConfig) serverValidateChirpHandler(w http.ResponseWriter, r *http.Request) {
+func (cfg *apiConfig) serverChirpHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Body string `json:"body"`
+		Body   string    `json:"body"`
+		UserId uuid.UUID `json:"user_id"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -115,7 +124,28 @@ func (cfg *apiConfig) serverValidateChirpHandler(w http.ResponseWriter, r *http.
 		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
 		return
 	}
-	respondWithJSON(w, http.StatusOK, params.Body)
+
+	responseChirp, err := cfg.dbQueries.CreateChirp(r.Context(), database.CreateChirpParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Body:      wordFilter(params.Body),
+		UserID:    params.UserId,
+	})
+	if err != nil {
+		log.Printf("Failed to create chirp: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to create chirp")
+		return
+	}
+	chirp := Chirp{
+		ID:        responseChirp.ID,
+		CreatedAt: responseChirp.CreatedAt,
+		UpdatedAt: responseChirp.UpdatedAt,
+		Body:      responseChirp.Body,
+		UserID:    responseChirp.UserID,
+	}
+
+	respondWithJSON(w, http.StatusCreated, chirp)
 }
 
 func ready_handler(w http.ResponseWriter, r *http.Request) {
@@ -130,10 +160,10 @@ func respondWithError(w http.ResponseWriter, code int, message string) {
 	json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
-func respondWithJSON(w http.ResponseWriter, code int, message string) {
+func respondWithJSON(w http.ResponseWriter, code int, message any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"cleaned_body": wordFilter(message)})
+	json.NewEncoder(w).Encode(message)
 }
 
 func wordFilter(message string) string {
@@ -172,7 +202,7 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", apiCfg.serverResetHandler)
 	mux.HandleFunc("GET /api/healthz", ready_handler)
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
-	mux.HandleFunc("POST /api/validate_chirp", apiCfg.serverValidateChirpHandler)
+	mux.HandleFunc("POST /api/chirps", apiCfg.serverChirpHandler)
 	serv := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
