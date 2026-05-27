@@ -148,6 +148,55 @@ func (cfg *apiConfig) serverChirpHandler(w http.ResponseWriter, r *http.Request)
 	respondWithJSON(w, http.StatusCreated, chirp)
 }
 
+func (cfg *apiConfig) serverGetChirpByIdHandler(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	chirpId, err := uuid.Parse(idStr)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+		return
+	}
+
+	responseChirp, err := cfg.dbQueries.GetChirpById(r.Context(), chirpId)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondWithError(w, http.StatusNotFound, "Chirp not found")
+			return
+		}
+		log.Printf("Failed to get chirp: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to get chirp")
+		return
+	}
+	chirp := Chirp{
+		ID:        responseChirp.ID,
+		CreatedAt: responseChirp.CreatedAt,
+		UpdatedAt: responseChirp.UpdatedAt,
+		Body:      responseChirp.Body,
+		UserID:    responseChirp.UserID,
+	}
+
+	respondWithJSON(w, http.StatusOK, chirp)
+}
+
+func (cfg *apiConfig) serverGetChirpsHandler(w http.ResponseWriter, r *http.Request) {
+	chirps, err := cfg.dbQueries.GetChirps(r.Context())
+	if err != nil {
+		log.Printf("Failed to get chirps: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to get chirps")
+		return
+	}
+	var response []Chirp
+	for _, c := range chirps {
+		response = append(response, Chirp{
+			ID:        c.ID,
+			CreatedAt: c.CreatedAt,
+			UpdatedAt: c.UpdatedAt,
+			Body:      c.Body,
+			UserID:    c.UserID,
+		})
+	}
+	respondWithJSON(w, http.StatusOK, response)
+}
+
 func ready_handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -203,6 +252,8 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", ready_handler)
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
 	mux.HandleFunc("POST /api/chirps", apiCfg.serverChirpHandler)
+	mux.HandleFunc("GET /api/chirps", apiCfg.serverGetChirpsHandler)
+	mux.HandleFunc("GET /api/chirps/{id}", apiCfg.serverGetChirpByIdHandler)
 	serv := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
