@@ -14,6 +14,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+
+	"github.com/mathias-schnell/chirpy/internal/auth"
 	"github.com/mathias-schnell/chirpy/internal/database"
 )
 
@@ -40,7 +42,8 @@ type Chirp struct {
 
 func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -54,16 +57,26 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 		respondWithError(w, http.StatusBadRequest, "Email is required")
 		return
 	}
+	if params.Password == "" {
+		respondWithError(w, http.StatusBadRequest, "Password is required")
+		return
+	}
+
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to hash password")
+		return
+	}
 
 	newUser := database.CreateUserParams{
-		ID:        uuid.New(),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-		Email:     params.Email,
+		ID:             uuid.New(),
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
 	}
 	responseUser, err := cfg.dbQueries.CreateUser(r.Context(), newUser)
 	if err != nil {
-		log.Printf("Failed to create user: %v", err)
 		respondWithError(w, http.StatusInternalServerError, "Failed to create user")
 		return
 	}
@@ -197,6 +210,54 @@ func (cfg *apiConfig) serverGetChirpsHandler(w http.ResponseWriter, r *http.Requ
 	respondWithJSON(w, http.StatusOK, response)
 }
 
+func (cfg *apiConfig) serverLoginHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	if params.Email == "" || params.Password == "" {
+		respondWithError(w, http.StatusBadRequest, "Email and password are required")
+		return
+	}
+
+	responseUser, err := cfg.dbQueries.GetUserByEmail(r.Context(), params.Email)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondWithError(w, http.StatusUnauthorized, "Invalid email or password")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "Failed to get user")
+		return
+	}
+
+	match, err := auth.CheckPasswordHash(params.Password, responseUser.HashedPassword)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to check password")
+		return
+	}
+	if !match {
+		respondWithError(w, http.StatusUnauthorized, "Invalid email or password")
+		return
+	}
+
+	user := User{
+		ID:        responseUser.ID,
+		CreatedAt: responseUser.CreatedAt,
+		UpdatedAt: responseUser.UpdatedAt,
+		Email:     responseUser.Email,
+	}
+
+	respondWithJSON(w, http.StatusOK, user)
+}
+
 func ready_handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -248,12 +309,13 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app/", http.FileServer(http.Dir(".")))))
 	mux.HandleFunc("GET /admin/metrics", apiCfg.serverGetHitsHandler)
-	mux.HandleFunc("POST /admin/reset", apiCfg.serverResetHandler)
 	mux.HandleFunc("GET /api/healthz", ready_handler)
-	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
-	mux.HandleFunc("POST /api/chirps", apiCfg.serverChirpHandler)
 	mux.HandleFunc("GET /api/chirps", apiCfg.serverGetChirpsHandler)
 	mux.HandleFunc("GET /api/chirps/{id}", apiCfg.serverGetChirpByIdHandler)
+	mux.HandleFunc("POST /admin/reset", apiCfg.serverResetHandler)
+	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
+	mux.HandleFunc("POST /api/chirps", apiCfg.serverChirpHandler)
+	mux.HandleFunc("POST /api/login", apiCfg.serverLoginHandler)
 	serv := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
