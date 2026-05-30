@@ -27,11 +27,12 @@ type apiConfig struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
-	Token     string    `json:"token,omitempty"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token,omitempty"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
 }
 
 type Chirp struct {
@@ -70,10 +71,11 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	now := time.Now()
 	newUser := database.CreateUserParams{
 		ID:             uuid.New(),
-		CreatedAt:      time.Now(),
-		UpdatedAt:      time.Now(),
+		CreatedAt:      now,
+		UpdatedAt:      now,
 		Email:          params.Email,
 		HashedPassword: hashedPassword,
 	}
@@ -151,10 +153,11 @@ func (cfg *apiConfig) serverChirpHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	now := time.Now()
 	responseChirp, err := cfg.dbQueries.CreateChirp(r.Context(), database.CreateChirpParams{
 		ID:        uuid.New(),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		CreatedAt: now,
+		UpdatedAt: now,
 		Body:      wordFilter(params.Body),
 		UserID:    userId,
 	})
@@ -224,9 +227,8 @@ func (cfg *apiConfig) serverGetChirpsHandler(w http.ResponseWriter, r *http.Requ
 
 func (cfg *apiConfig) serverLoginHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Email            string `json:"email"`
-		Password         string `json:"password"`
-		ExpiresInSeconds int    `json:"expires_in_seconds"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -239,9 +241,6 @@ func (cfg *apiConfig) serverLoginHandler(w http.ResponseWriter, r *http.Request)
 	if params.Email == "" || params.Password == "" {
 		respondWithError(w, http.StatusBadRequest, "Email and password are required")
 		return
-	}
-	if params.ExpiresInSeconds <= 0 || params.ExpiresInSeconds > 3600 {
-		params.ExpiresInSeconds = 3600
 	}
 
 	responseUser, err := cfg.dbQueries.GetUserByEmail(r.Context(), params.Email)
@@ -264,20 +263,107 @@ func (cfg *apiConfig) serverLoginHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	token, err := auth.MakeJWT(responseUser.ID, cfg.secretKey, time.Duration(params.ExpiresInSeconds)*time.Second)
+	token, err := auth.MakeJWT(responseUser.ID, cfg.secretKey, time.Duration(3600)*time.Second)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to create token")
 		return
 	}
 
+	now := time.Now()
+	refreshToken := auth.MakeRefreshToken()
+	_, err = cfg.dbQueries.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+		Token:     refreshToken,
+		CreatedAt: now,
+		UpdatedAt: now,
+		UserID:    responseUser.ID,
+		ExpiresAt: now.Add(60 * 24 * time.Hour),
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to create refresh token")
+		return
+	}
+
 	user := User{
-		ID:        responseUser.ID,
-		CreatedAt: responseUser.CreatedAt,
-		UpdatedAt: responseUser.UpdatedAt,
-		Email:     responseUser.Email,
-		Token:     token,
+		ID:           responseUser.ID,
+		CreatedAt:    responseUser.CreatedAt,
+		UpdatedAt:    responseUser.UpdatedAt,
+		Email:        responseUser.Email,
+		Token:        token,
+		RefreshToken: refreshToken,
 	}
 	respondWithJSON(w, http.StatusOK, user)
+}
+
+func (cfg *apiConfig) serverRefreshHandler(w http.ResponseWriter, r *http.Request) {
+	type Token struct {
+		Token string `json:"token"`
+	}
+
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid or missing token")
+		return
+	}
+
+	responseToken, err := cfg.dbQueries.GetRefreshTokenByToken(r.Context(), tokenStr)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondWithError(w, http.StatusUnauthorized, "Invalid refresh token")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "Failed to get refresh token")
+		return
+	}
+
+	if responseToken.ExpiresAt.Before(time.Now()) || responseToken.RevokedAt.Valid {
+		respondWithError(w, http.StatusUnauthorized, "Refresh token is expired or revoked")
+		return
+	}
+
+	user, err := cfg.dbQueries.GetUserFromRefreshToken(r.Context(), tokenStr)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondWithError(w, http.StatusUnauthorized, "Invalid refresh token")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "Failed to get user from refresh token")
+		return
+	}
+
+	newToken, err := auth.MakeJWT(user.ID, cfg.secretKey, time.Duration(3600)*time.Second)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to create token")
+		return
+	}
+
+	token := Token{
+		Token: newToken,
+	}
+
+	respondWithJSON(w, http.StatusOK, token)
+}
+
+func (cfg *apiConfig) serverRevokeHandler(w http.ResponseWriter, r *http.Request) {
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid or missing token")
+		return
+	}
+
+	err = cfg.dbQueries.RevokeRefreshToken(r.Context(), database.RevokeRefreshTokenParams{
+		Token:     tokenStr,
+		RevokedAt: sql.NullTime{Valid: true, Time: time.Now()},
+	})
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondWithError(w, http.StatusUnauthorized, "Invalid refresh token")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "Failed to revoke refresh token")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func ready_handler(w http.ResponseWriter, r *http.Request) {
@@ -339,6 +425,8 @@ func main() {
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
 	mux.HandleFunc("POST /api/chirps", apiCfg.serverChirpHandler)
 	mux.HandleFunc("POST /api/login", apiCfg.serverLoginHandler)
+	mux.HandleFunc("POST /api/refresh", apiCfg.serverRefreshHandler)
+	mux.HandleFunc("POST /api/revoke", apiCfg.serverRevokeHandler)
 	serv := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
