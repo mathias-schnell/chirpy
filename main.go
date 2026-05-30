@@ -23,6 +23,7 @@ type apiConfig struct {
 	dbQueries      *database.Queries
 	fileserverHits atomic.Int32
 	platform       string
+	secretKey      string
 }
 
 type User struct {
@@ -30,6 +31,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Token     string    `json:"token,omitempty"`
 }
 
 type Chirp struct {
@@ -126,9 +128,20 @@ func (cfg *apiConfig) serverChirpHandler(w http.ResponseWriter, r *http.Request)
 		UserId uuid.UUID `json:"user_id"`
 	}
 
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid or missing token")
+		return
+	}
+	userId, err := auth.ValidateJWT(token, cfg.secretKey)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid or expired token")
+		return
+	}
+
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
-	err := decoder.Decode(&params)
+	err = decoder.Decode(&params)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
 		return
@@ -143,10 +156,9 @@ func (cfg *apiConfig) serverChirpHandler(w http.ResponseWriter, r *http.Request)
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		Body:      wordFilter(params.Body),
-		UserID:    params.UserId,
+		UserID:    userId,
 	})
 	if err != nil {
-		log.Printf("Failed to create chirp: %v", err)
 		respondWithError(w, http.StatusInternalServerError, "Failed to create chirp")
 		return
 	}
@@ -179,6 +191,7 @@ func (cfg *apiConfig) serverGetChirpByIdHandler(w http.ResponseWriter, r *http.R
 		respondWithError(w, http.StatusInternalServerError, "Failed to get chirp")
 		return
 	}
+
 	chirp := Chirp{
 		ID:        responseChirp.ID,
 		CreatedAt: responseChirp.CreatedAt,
@@ -186,7 +199,6 @@ func (cfg *apiConfig) serverGetChirpByIdHandler(w http.ResponseWriter, r *http.R
 		Body:      responseChirp.Body,
 		UserID:    responseChirp.UserID,
 	}
-
 	respondWithJSON(w, http.StatusOK, chirp)
 }
 
@@ -212,8 +224,9 @@ func (cfg *apiConfig) serverGetChirpsHandler(w http.ResponseWriter, r *http.Requ
 
 func (cfg *apiConfig) serverLoginHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email            string `json:"email"`
+		Password         string `json:"password"`
+		ExpiresInSeconds int    `json:"expires_in_seconds"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -226,6 +239,9 @@ func (cfg *apiConfig) serverLoginHandler(w http.ResponseWriter, r *http.Request)
 	if params.Email == "" || params.Password == "" {
 		respondWithError(w, http.StatusBadRequest, "Email and password are required")
 		return
+	}
+	if params.ExpiresInSeconds <= 0 || params.ExpiresInSeconds > 3600 {
+		params.ExpiresInSeconds = 3600
 	}
 
 	responseUser, err := cfg.dbQueries.GetUserByEmail(r.Context(), params.Email)
@@ -248,13 +264,19 @@ func (cfg *apiConfig) serverLoginHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	token, err := auth.MakeJWT(responseUser.ID, cfg.secretKey, time.Duration(params.ExpiresInSeconds)*time.Second)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to create token")
+		return
+	}
+
 	user := User{
 		ID:        responseUser.ID,
 		CreatedAt: responseUser.CreatedAt,
 		UpdatedAt: responseUser.UpdatedAt,
 		Email:     responseUser.Email,
+		Token:     token,
 	}
-
 	respondWithJSON(w, http.StatusOK, user)
 }
 
@@ -304,6 +326,7 @@ func main() {
 	apiCfg := &apiConfig{
 		dbQueries: database.New(db),
 		platform:  os.Getenv("PLATFORM"),
+		secretKey: os.Getenv("SECRET_KEY"),
 	}
 
 	mux := http.NewServeMux()
